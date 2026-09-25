@@ -8,6 +8,7 @@ Run:
     streamlit run app.py
 """
 import re
+import time
 from datetime import date, timedelta
 
 import numpy as np
@@ -62,17 +63,51 @@ def norm_ticker(t):
     return t.strip().upper().replace(".", "-").replace(":", "-")
 
 # ---------------------------------------------------------------- data layer
+def _safe_download(tickers, start_iso, end_iso):
+    try:
+        return yf.download(list(tickers), start=start_iso, end=end_iso,
+                           auto_adjust=True, progress=False, threads=True)
+    except Exception:
+        return None
+
+
+def _close_frame(df, tickers):
+    """Extract a ticker-keyed Close DataFrame, robust to yfinance column layouts."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = set(df.columns.get_level_values(0))
+        if "Close" in lvl0:                      # (Field, Ticker) layout
+            closes = df["Close"]
+        else:                                    # (Ticker, Field) layout
+            closes = df.xs("Close", axis=1, level=1)
+    else:                                        # single ticker, flat columns
+        closes = df[["Close"]] if "Close" in df.columns else pd.DataFrame()
+    if isinstance(closes, pd.Series):
+        closes = closes.to_frame(tickers[0] if tickers else "Close")
+    return closes
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def download_prices(tickers, start_iso, end_iso):
-    """Daily closes via yfinance (auto-adjusted). Returns (closes_df, failed)."""
-    df = yf.download(list(tickers), start=start_iso, end=end_iso,
-                     auto_adjust=True, progress=False, threads=True)
-    if df is None or df.empty:
-        return None, list(tickers)
-    closes = df["Close"]
-    if isinstance(closes, pd.Series):  # single ticker
-        closes = closes.to_frame(tickers[0])
+    """Daily closes via yfinance (auto-adjusted). Returns (closes_df, failed).
+
+    One batched request for all tickers; any ticker that comes back empty is
+    retried individually (Yahoo intermittently drops single tickers)."""
+    tickers = list(tickers)
+    closes = _close_frame(_safe_download(tickers, start_iso, end_iso), tickers)
     closes = closes.dropna(axis=1, how="all")
+    for t in [t for t in tickers if t not in closes.columns]:
+        s = None
+        for _ in range(3):
+            one = _close_frame(_safe_download([t], start_iso, end_iso), [t])
+            if not one.empty and t in one.columns and one[t].notna().any():
+                s = one[t]
+                break
+            time.sleep(2)
+        if s is not None:
+            closes[t] = s
+    closes = closes[[t for t in tickers if t in closes.columns]]
     failed = [t for t in tickers if t not in closes.columns]
     closes = closes.dropna(how="any")
     closes.index = pd.to_datetime(closes.index).tz_localize(None).normalize()
@@ -318,7 +353,12 @@ if "ed_key" not in st.session_state:
     st.session_state.ed_key = 0
 
 def reset_holdings(df):
-    st.session_state.hold_df = df
+    # Rebuild with explicit dtypes: an empty frame from [] infers float64,
+    # which breaks the TextColumn config and kills the editor (Clear bug).
+    st.session_state.hold_df = pd.DataFrame({
+        "Ticker": pd.Series(list(df["Ticker"]), dtype="str"),
+        "Amount": pd.to_numeric(df["Amount"], errors="coerce").astype("float64"),
+    })
     st.session_state.ed_key += 1
     st.rerun()
 
@@ -413,10 +453,14 @@ def run_analysis(df, years, bench, rf, sizing_mode, mode):
     H = holdings_metrics(rets[:, :n_h], weights, port_rets, rf)
     monthly = monthly_returns(ret_dates, port_rets)
     bench_eq = (10000 * np.cumprod(1 + bench_rets)) if bench_rets is not None else None
+    # full benchmark metric set, so every displayed number has a benchmark twin
+    BM = portfolio_metrics(bench_rets, None, rf) if bench_rets is not None else None
+    bench_monthly = monthly_returns(ret_dates, bench_rets) if bench_rets is not None else None
     return dict(holdings=[t for t, _ in ok_hold], weights=weights, dates=dates,
                 ret_dates=ret_dates, port_rets=port_rets, bench_rets=bench_rets,
                 rets_hold=rets[:, :n_h],
-                M=M, H=H, monthly=monthly, bench_eq=bench_eq, bench=bench,
+                M=M, BM=BM, H=H, monthly=monthly, bench_monthly=bench_monthly,
+                bench_eq=bench_eq, bench=bench,
                 bench_label=bench_label, rf=rf, years=years, sizing_mode=sizing_mode,
                 failed_hold=failed_hold,
                 bench_failed=bool(bench and bench not in closes.columns)), None
@@ -445,6 +489,11 @@ M, H = res["M"], res["H"]
 tickers, w = res["holdings"], res["weights"]
 pr, br, dates, rdates = res["port_rets"], res["bench_rets"], res["dates"], res["ret_dates"]
 has_b = br is not None and np.isfinite(M.get("beta", np.nan))
+BM = res["BM"]
+
+def bmk(key, fm=pct):
+    """'Bench X: value' twin for any metric, or a no-benchmark note."""
+    return f"Bench {res['bench']}: {fm(BM[key])}" if has_b else "no benchmark"
 
 st.title("Portfolio characteristics")
 st.markdown(f'<p class="src-note">{len(tickers)} holdings · {res["years"]}Y window · '
@@ -455,14 +504,14 @@ tab_ov, tab_pf, tab_rk, tab_hd = st.tabs(["Overview", "Performance", "Risk", "Ho
 
 with tab_ov:
     c = st.columns(4)
-    with c[0]: kpi_card("CAGR", pct(M["cagr"]), f"{res['years']}Y annualized", cls(M["cagr"]))
-    with c[1]: kpi_card("Volatility", pct(M["vol"]), "annualized σ")
-    with c[2]: kpi_card("Sharpe", num2(M["sharpe"]), f"rf {res['rf']*100:.1f}%", cls(M["sharpe"]))
-    with c[3]: kpi_card("Max drawdown", pct(M["max_dd"]), "peak → trough", "neg")
+    with c[0]: kpi_card("CAGR", pct(M["cagr"]), f"{res['years']}Y ann. · " + bmk("cagr"), cls(M["cagr"]))
+    with c[1]: kpi_card("Volatility", pct(M["vol"]), "ann. σ · " + bmk("vol"))
+    with c[2]: kpi_card("Sharpe", num2(M["sharpe"]), f"rf {res['rf']*100:.1f}% · " + bmk("sharpe", num2), cls(M["sharpe"]))
+    with c[3]: kpi_card("Max drawdown", pct(M["max_dd"]), "peak → trough · " + bmk("max_dd"), "neg")
     c = st.columns(4)
     with c[0]: kpi_card("Beta", num2(M.get("beta")), f"vs {res['bench']}" if has_b else "no benchmark")
     with c[1]: kpi_card("Alpha", pct(M.get("alpha")), f"annualized, vs {res['bench'] if has_b else '—'}", cls(M.get("alpha")))
-    with c[2]: kpi_card("VaR 95%", pct(M["var95"]), "daily loss threshold", "neg")
+    with c[2]: kpi_card("VaR 95%", pct(M["var95"]), "daily · " + bmk("var95"), "neg")
     with c[3]: kpi_card("Correlation", num2(M.get("corr")), f"vs {res['bench']}" if has_b else "no benchmark")
     st.plotly_chart(growth_chart(rdates, M["equity"][1:],
                                  res["bench_eq"], res["bench"] if has_b else ""),
@@ -481,29 +530,42 @@ with tab_pf:
     with c2:
         st.plotly_chart(rolling_vol_chart(rdates, pr), use_container_width=True)
     pos_m = [r for _, r in res["monthly"] if r > 0]
+    if has_b:
+        bm_m = res["bench_monthly"]
+        bm_pos = [r for _, r in bm_m if r > 0]
+        bm_avg = np.mean([r for _, r in bm_m])
+        bm_pos_rate = len(bm_pos) / len(bm_m)
+        bm_best = max(bm_m, key=lambda x: x[1])
+        bm_worst = min(bm_m, key=lambda x: x[1])
     c = st.columns(4)
-    with c[0]: kpi_card("Avg monthly", pct(np.mean([r for _, r in res["monthly"]])), f"{len(res['monthly'])} months")
-    with c[1]: kpi_card("Positive months", pct(len(pos_m) / len(res["monthly"]), 0))
+    with c[0]: kpi_card("Avg monthly", pct(np.mean([r for _, r in res["monthly"]])),
+                        f"{len(res['monthly'])} mo · Bench: {pct(bm_avg)}" if has_b else f"{len(res['monthly'])} months")
+    with c[1]: kpi_card("Positive months", pct(len(pos_m) / len(res["monthly"]), 0),
+                        f"Bench: {pct(bm_pos_rate, 0)}" if has_b else "share of months")
     with c[2]:
         ym, r = max(res["monthly"], key=lambda x: x[1])
-        kpi_card("Best month", pct(r), ym, "pos")
+        kpi_card("Best month", pct(r), ym + (f" · Bench {bm_best[0]}: {pct(bm_best[1])}" if has_b else ""), "pos")
     with c[3]:
         ym, r = min(res["monthly"], key=lambda x: x[1])
-        kpi_card("Worst month", pct(r), ym, "neg")
+        kpi_card("Worst month", pct(r), ym + (f" · Bench {bm_worst[0]}: {pct(bm_worst[1])}" if has_b else ""), "neg")
 
 with tab_rk:
     c = st.columns(4)
-    with c[0]: kpi_card("VaR 95%", pct(M["var95"]), "daily", "neg")
-    with c[1]: kpi_card("CVaR 95%", pct(M["cvar95"]), "daily expected shortfall", "neg")
-    with c[2]: kpi_card("Downside dev", pct(M["down_dev"]), "annualized")
-    with c[3]: kpi_card("Sortino", num2(M["sortino"]), f"rf {res['rf']*100:.1f}%", cls(M["sortino"]))
+    with c[0]: kpi_card("VaR 95%", pct(M["var95"]), "daily · " + bmk("var95"), "neg")
+    with c[1]: kpi_card("CVaR 95%", pct(M["cvar95"]), "daily ES · " + bmk("cvar95"), "neg")
+    with c[2]: kpi_card("Downside dev", pct(M["down_dev"]), "ann. · " + bmk("down_dev"))
+    with c[3]: kpi_card("Sortino", num2(M["sortino"]), f"rf {res['rf']*100:.1f}% · " + bmk("sortino", num2), cls(M["sortino"]))
     c = st.columns(4)
-    with c[0]: kpi_card("Skewness", num2(M["skew"]), "daily returns")
-    with c[1]: kpi_card("Kurtosis", num2(M["kurt"]), "excess, daily")
-    with c[2]: kpi_card("Calmar", num2(M["calmar"]), "CAGR / |maxDD|", cls(M["calmar"]))
-    with c[3]: kpi_card("Win rate", pct(M["win_rate"], 0), "positive days")
+    with c[0]: kpi_card("Skewness", num2(M["skew"]), "daily · " + bmk("skew", num2))
+    with c[1]: kpi_card("Kurtosis", num2(M["kurt"]), "excess · " + bmk("kurt", num2))
+    with c[2]: kpi_card("Calmar", num2(M["calmar"]), "CAGR/|maxDD| · " + bmk("calmar", num2), cls(M["calmar"]))
+    with c[3]: kpi_card("Win rate", pct(M["win_rate"], 0),
+                        "pos. days · " + (f"Bench: {pct(BM['win_rate'], 0)}" if has_b else "no benchmark"))
+    bench_tail = (f" · **Bench maxDD:** {pct(BM['max_dd'])}"
+                  f" · **Bench best day:** {pct(BM['best_day'])}"
+                  f" · **Bench worst day:** {pct(BM['worst_day'])}") if has_b else ""
     st.markdown(f"**Max drawdown:** {pct(M['max_dd'])} from {rdates[M['dd_peak']]} to {rdates[M['dd_trough']]} · "
-                f"**Best day:** {pct(M['best_day'])} · **Worst day:** {pct(M['worst_day'])}")
+                f"**Best day:** {pct(M['best_day'])} · **Worst day:** {pct(M['worst_day'])}" + bench_tail)
     if has_b:
         st.subheader("Benchmark-relative")
         rel = pd.DataFrame([
@@ -525,8 +587,8 @@ with tab_rk:
     st.plotly_chart(risk_bar_fig(tickers, rc), use_container_width=True)
 
 with tab_hd:
-    dfh = pd.DataFrame({
-        "Ticker": tickers,
+    rows = {
+        "Ticker": list(tickers),
         "Weight": [pct(x) for x in w],
         "CAGR": [pct(h["cagr"]) for h in H],
         "Total return": [pct(h["total_ret"]) for h in H],
@@ -535,7 +597,18 @@ with tab_hd:
         "Beta (vs portf.)": [num2(h["beta"]) for h in H],
         "Return contrib.": [pct(h["ret_contrib"]) for h in H],
         "Risk contrib.": [pct(h["risk_contrib"]) for h in H],
-    })
+    }
+    if has_b:  # benchmark twin row for direct comparison
+        rows["Ticker"].append(f"{res['bench']} (bench)")
+        rows["Weight"].append("—")
+        rows["CAGR"].append(pct(BM["cagr"]))
+        rows["Total return"].append(pct(BM["total_ret"]))
+        rows["Volatility"].append(pct(BM["vol"]))
+        rows["Sharpe"].append(num2(BM["sharpe"]))
+        rows["Beta (vs portf.)"].append("1.00")
+        rows["Return contrib."].append("—")
+        rows["Risk contrib."].append("—")
+    dfh = pd.DataFrame(rows)
     st.dataframe(dfh, use_container_width=True, hide_index=True)
     st.caption("Return contrib. ≈ weight × holding CAGR. Risk contrib. = Euler share of portfolio volatility (sums to 100%).")
 
@@ -552,6 +625,8 @@ with st.expander("Methodology & data notes"):
 - **Up/down capture** = mean portfolio return on up/down benchmark days ÷ mean benchmark return on those days.
 - **Risk contribution** is the Euler decomposition: wᵢ·(Σw)ᵢ / σ² — the share of portfolio variance/volatility
   attributable to each holding; sums to 100%.
+- Every metric card shows its **benchmark twin** (same metric computed on the benchmark over the
+  identical window), and the Holdings table ends with a benchmark row for direct comparison.
 - **Sizing:** buy & hold lets position values compound (weights drift); rebalanced holds fixed target weights daily.
 - Educational analysis, not investment advice.
 """)
